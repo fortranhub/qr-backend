@@ -1,0 +1,138 @@
+name: Run Integration Tests
+
+on:
+  push:
+    branches: 
+      - dev
+      
+env:
+  DOCKER_REPO: "hakobmkoyan771"
+  IMAGE_NAME: "backend-qr"
+
+jobs:
+  get-change-prerelease-tag:
+    runs-on:
+      - ubuntu-latest
+
+    outputs:
+      incremented-release-candidate-version: ${{ steps.increment-release-candidate.outputs.next-version }}
+      initial-release-candidate-version: ${{ steps.new-release-candidate-version.outputs.next-version }}
+    
+    steps:
+      - name: Checkout Current Branch
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.ref }}
+        
+      - name: Get Latest Prerelease Tag
+        uses: actions-ecosystem/action-get-latest-tag@v1
+        id: get-latest-tag
+          
+      - name: Get rc_version From VERSION
+        run: echo "RC_VERSION=$(jq -e -r .rc_version VERSION)" >> $GITHUB_OUTPUT
+        id: rc_version
+
+      - name: Increment Release Candidate
+        if: contains(steps.get-latest-tag.outputs.tag, steps.rc_version.outputs.RC_VERSION) == true
+        id: increment-release-candidate
+        uses: christian-draeger/increment-semantic-version@1.0.2
+        with:
+          current-version: ${{ steps.get-latest-tag.outputs.tag }}
+          version-fragment: rc        
+          
+      - name: Create New Release Candidate Version
+        if: contains(steps.get-latest-tag.outputs.tag, steps.rc_version.outputs.RC_VERSION) == false
+        id: new-release-candidate-version
+        uses: christian-draeger/increment-semantic-version@1.0.2
+        with:
+          current-version: ${{ steps.rc_version.outputs.RC_VERSION }}
+          version-fragment: rc
+
+  create-prerelease:
+    runs-on:
+      - ubuntu-latest
+    
+    needs:
+      - get-change-prerelease-tag
+      
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        
+      - name: PreRelease Incremented Tag
+        if: needs.get-change-prerelease-tag.outputs.incremented-release-candidate-version != ''
+        id: incremented-release
+        uses: igorrs/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.get-change-prerelease-tag.outputs.incremented-release-candidate-version }}
+          release_name: ${{ needs.get-change-prerelease-tag.outputs.incremented-release-candidate-version }}
+          prerelease: true
+          
+      - name: PreRelease New Tag
+        if: needs.get-change-prerelease-tag.outputs.initial-release-candidate-version != ''
+        id: new-release
+        uses: igorrs/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ needs.get-change-prerelease-tag.outputs.initial-release-candidate-version }}
+          release_name: ${{ needs.get-change-prerelease-tag.outputs.initial-release-candidate-version }}
+          prerelease: true
+
+  build-and-push-docker-image:
+    runs-on:
+      - ubuntu-latest
+      
+    needs: 
+      - get-change-prerelease-tag
+      - create-prerelease
+    
+    steps:
+      - name: Checkout Current Branch
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.ref }}    
+             
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build, tag, and push image to DockerHub
+        if: needs.get-change-prerelease-tag.outputs.incremented-release-candidate-version != ''
+        run: |
+          docker build -t $DOCKER_REPO/$IMAGE_NAME:${{ needs.get-change-prerelease-tag.outputs.incremented-release-candidate-version }} .
+          docker push $DOCKER_REPO/$IMAGE_NAME:${{ needs.get-change-prerelease-tag.outputs.incremented-release-candidate-version }}
+      - name: Build, tag, and push image to DockerHub
+        if: needs.get-change-prerelease-tag.outputs.initial-release-candidate-version != ''
+        run: |
+          docker build -t $DOCKER_REPO/$IMAGE_NAME:${{ needs.get-change-prerelease-tag.outputs.initial-release-candidate-version }} .
+          docker push $DOCKER_REPO/$IMAGE_NAME:${{ needs.get-change-prerelease-tag.outputs.initial-release-candidate-version }}
+  
+  create-pr:
+    runs-on:
+      - ubuntu-latest
+    
+    needs: 
+      - build-and-push-docker-image
+      
+    steps:
+      - name: Checkout Current Branch
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ github.ref }}    
+
+      - name: Get rc_version From VERSION
+        run: echo "RC_VERSION=$(jq -e -r .rc_version VERSION)" >> $GITHUB_OUTPUT
+        id: rc_version
+
+      - name: Create PR
+        uses: thomaseizinger/create-pull-request@master
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          head: ${{ github.event.pull_request.base.ref }}
+          base: main
+          title: "An automatically created PR for version ${{ steps.rc_version.outputs.RC_VERSION }} !"
